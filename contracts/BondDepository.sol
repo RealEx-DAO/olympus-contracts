@@ -36,6 +36,7 @@ contract OlympusBondDepository {
     bool capacityInPrincipal; // capacity limit is in payout or principal terms
     uint256 totalDebt; // total debt from bond (in OHM)
     uint256 last; // timestamp of last bond
+    bool enabled; // defaults to false if safe mode is enabled
   }
 
   // Info for creating new bonds
@@ -45,133 +46,36 @@ contract OlympusBondDepository {
     bool fixedTerm; // fixed term or fixed expiration
     uint256 vesting; // term in seconds if fixedTerm == true, expiration timestamp if not
     uint256 maxDebt; // max OHM debt accrued at a time
+    uint256 minDebt; // minimum OHM debt at a time
   }
 
   struct Global {
     uint256 decayRate; // time in seconds to decay debt to zero.
     uint256 maxPayout; // percentage total supply. 9 decimals.
+    bool safeMode; // if true, bond must be enabled after adding
   }
 
   /* ======== STATE VARIABLES ======== */
+
+  ITeller public teller; // handles payment
+  address public controller; // adds or deprecated bonds
+  ITreasury internal immutable treasury;
+  IERC20 internal immutable ohm;
 
   mapping(uint256 => Bond) public bonds;
   address[] public ids; // bond IDs
 
   Global public global;
 
-  ITeller public teller; // handles payment
-  address public controller; // adds or deprecated bonds
+  /* ======== CONSTRUCTOR ======== */
 
-  ITreasury internal immutable treasury;
-  IERC20 internal immutable ohm;
-
-    /* ======== CONSTRUCTOR ======== */
-
-    constructor(address _ohm, address _treasury) {
-      require(_ohm != address(0), "Zero address: OHM");
-      ohm = IERC20(_ohm);
-      require(_treasury != address(0), "Zero address: Treasury");
-      treasury = ITreasury(_treasury);
-      controller = msg.sender;
-    }
-
-    /* ======== POLICY FUNCTIONS ======== */
-
-    /**
-     * On creating bonds: New bond is created with a principal token to purchase,
-     * an oracle quoting an 8 decimal price of that token in OHM, a budget capacity
-     * (specified as in OHM or in principal token terms), a timestamp when the
-     * bond concludes, and a vesting term or expiration timestamp dictated by
-     * _fixedTerm being true or false, respectively.
-     * 
-     * The contract computes a BCV based on the amount of OHM to spend or principal
-     * to buy, and the intended time to do it in (time from initialization to conclusion).
-     * The bond is initialized with an amount of initial debt, which should start it
-     * at the oracle price. Debt will decay from there to open discounts.
-     */
-
-    /**
-    * @notice creates a new bond type
-    * @param _principal address
-    * @param _oracle address
-    * @param _capacity uint256
-    * @param _inPrincipal bool
-    * @param _length uint256
-    * @param _fixedTerm bool
-    * @param _vesting uint256
-    * @return id_ uint256
-    */
-  function addBond(
-    IERC20 _principal,
-    IOracle _oracle,
-    uint256 _capacity,
-    bool _inPrincipal,
-    uint256 _length,
-    bool _fixedTerm,
-    uint256 _vesting
-  ) external onlyController returns (uint256 id_) {
-    (uint targetDebt, uint256 bcv) = _compute(_capacity, _inPrincipal, _length, _oracle);
-    
-    _checkLengths(_length, _vesting, _fixedTerm);
-
-    Terms memory terms = Terms({
-      controlVariable: bcv, 
-      conclusion: block.timestamp + _length,
-      fixedTerm: _fixedTerm, 
-      vesting: _vesting,
-      maxDebt: targetDebt * 3 // exists to hedge tail risk. wide buffer important so as not to impede functionality.
-    });
-    
-    Bond memory bond = Bond({
-      principal: _principal, 
-      oracle: _oracle, 
-      terms: terms, 
-      totalDebt: targetDebt, 
-      last: block.timestamp, 
-      capacity: _capacity, 
-      capacityInPrincipal: _inPrincipal
-    });
-    
-    id_ = ids.length;
-    bonds[id_] = bond;
-    ids.push(address(_principal));
-  }
-
-  /**
-   * @notice disable existing bond
-   * @param _bid uint
-   */
-  function deprecateBond(uint256 _bid) external onlyController {
-    bonds[_bid].capacity = 0;
-  }
-
-  /**
-   * @notice set global variables
-   * @param _decayRate uint256
-   * @param _maxPayout uint256
-   */
-  function setGlobal(uint256 _decayRate, uint256 _maxPayout) external onlyController {
-    global.decayRate = _decayRate;
-    global.maxPayout = _maxPayout;
-  }
-
-  /**
-   * @notice set teller contract
-   * @param _teller address
-   */
-  function setTeller(address _teller) external onlyController {
-    require(address(teller) == address(0), "Teller is set");
-    require(_teller != address(0), "Zero address: Teller");
-    teller = ITeller(_teller);
-  }
-
-  /**
-   * @notice sets address that creates/disables bonds
-   * @param _controller address
-   */
-  function setController(address _controller) external onlyController {
-    require(_controller != address(0), "Zero address: Controller");
-    controller = _controller;
+  constructor(address _ohm, address _treasury) {
+    require(_ohm != address(0), "Zero address: OHM");
+    ohm = IERC20(_ohm);
+    require(_treasury != address(0), "Zero address: Treasury");
+    treasury = ITreasury(_treasury);
+    controller = msg.sender;
+    global.safeMode = true;
   }
 
   /* ======== MUTABLE FUNCTIONS ======== */
@@ -209,7 +113,14 @@ contract OlympusBondDepository {
     info.capacity -= cap;
 
     _payoutWithinBounds(payout_);
+
+    if (info.totalDebt < info.terms.minDebt) {
+      info.capacity = 0; // disable bond if debt below min bound
+    }
     info.totalDebt += payout_; // increase total debt
+    if (info.totalDebt > info.terms.maxDebt) {
+      info.capacity = 0; // disable bond if debt above max bound
+    }
 
     uint256 expiration = info.terms.vesting;
     if (info.terms.fixedTerm) {
@@ -217,7 +128,6 @@ contract OlympusBondDepository {
     }
 
     emit CreateBond(_bid, payout_, expiration);
-
     // user info stored with teller
     index_ = teller.newBond(_depositor, _bid, payout_, expiration, _feo);
 
@@ -228,18 +138,16 @@ contract OlympusBondDepository {
   /* ======== INTERNAL FUNCTIONS ======== */
 
   // checks and event before bond
-  function _beforeBond(Bond memory _info, uint256 _bid) public {
+  function _beforeBond(Bond memory _info, uint256 _bid) internal {
     require(block.timestamp < _info.terms.conclusion, "Bond concluded");
+    require(_info.enabled, "Safe mode: bond not enabled");
 
-    decayDebt(_bid);
-
+    _decayDebt(_bid);
     emit BeforeBond(_bid, bondPriceInUSD(_bid), bondPrice(_bid), debtRatio(_bid));
-
-    require(_info.totalDebt <= _info.terms.maxDebt, "Max debt exceeded");
   }
 
   // reduce total debt based on time passed
-  function decayDebt(uint256 _bid) internal {
+  function _decayDebt(uint256 _bid) internal {
     bonds[_bid].totalDebt -= debtDecay(_bid);
     bonds[_bid].last = block.timestamp;
   }
@@ -248,38 +156,6 @@ contract OlympusBondDepository {
   function _payoutWithinBounds(uint256 _payout) public view {
     require(_payout >= 10000000, "Bond too small"); // must be > 0.01 OHM ( underflow protection )
     require(_payout <= maxPayout(), "Bond too large"); // global max bond size
-  }
-
-  /**
-   * @notice compute target debt and BCV for bond
-   * @return targetDebt_ uint256
-   * @return bcv_ uint256
-   */
-  function _compute(
-    uint256 _capacity, 
-    bool _inPrincipal, 
-    uint256 _length, 
-    IOracle _oracle
-  ) public view returns (uint256 targetDebt_, uint256 bcv_) {
-    uint256 capacity = _capacity;
-    if (_inPrincipal) {
-      capacity = _capacity * _oracle.assetPrice() / 1e8;
-    }
-
-    targetDebt_ = capacity * global.decayRate / _length;
-    uint256 discountedPrice = _oracle.assetPrice() * 98 / 100; // assume average discount of 2%
-    bcv_ = discountedPrice * ohm.totalSupply() / targetDebt_;
-    targetDebt_ = targetDebt * 102 / 100; // adjust back up to start at market price
-  }
-  
-  // ensure bond times are appropriate
-  function _checkLengths(uint256 _length, uint256 _vesting, bool _fixedTerm) public view {
-    require(_length >= 5e6, "Program must run longer than 6 days");
-    if (!_fixedTerm) {
-      require(_vesting >= _conclusion, "Bond must conclude before expiration");
-    } else {
-      require(_vesting >= 5e6, "Bond must vest longer than 6 days");
-    }
   }
 
   /* ======== VIEW FUNCTIONS ======== */
@@ -391,5 +267,152 @@ contract OlympusBondDepository {
     fixedTerm_ = terms.fixedTerm;
     vesting_ = terms.vesting;
     maxDebt_ = terms.maxDebt;
+  }
+
+  /* ======== POLICY FUNCTIONS ======== */
+
+  /**
+   * On creating bonds: New bond is created with a principal token to purchase,
+   * an oracle quoting an 8 decimal price of that token in OHM, a budget capacity
+   * (specified as in OHM or in principal token terms), a timestamp when the
+   * bond concludes, and a vesting term or expiration timestamp dictated by
+   * _fixedTerm being true or false, respectively.
+   * 
+   * The contract computes a BCV based on the amount of OHM to spend or principal
+   * to buy, and the intended time to do it in (time from initialization to conclusion).
+   * The bond is initialized with an amount of initial debt, which should start it
+   * at the oracle price. Debt will decay from there to open discounts.
+   */
+
+  /**
+   * @notice creates a new bond type
+   * @param _principal address
+   * @param _oracle address
+   * @param _capacity uint256
+   * @param _inPrincipal bool
+   * @param _length uint256
+   * @param _fixedTerm bool
+   * @param _vesting uint256
+   * @return id_ uint256
+   */
+  function addBond(
+    IERC20 _principal,
+    IOracle _oracle,
+    uint256 _capacity,
+    bool _inPrincipal,
+    uint256 _length,
+    bool _fixedTerm,
+    uint256 _vesting
+  ) external onlyController returns (uint256 id_) {
+    (uint targetDebt, uint256 bcv) = _compute(_capacity, _inPrincipal, _length, _oracle);
+    
+    _checkLengths(_length, _vesting, _fixedTerm);
+
+    Terms memory terms = Terms({
+      controlVariable: bcv, 
+      conclusion: block.timestamp + _length,
+      fixedTerm: _fixedTerm, 
+      vesting: _vesting,
+      maxDebt: targetDebt * 2, // these hedge tail risk by keeping debt in a range
+      minDebt: targetDebt / 2 // wide spread given (-50%, +100%) to avoid impeding functionality
+    });
+    
+    Bond memory bond = Bond({
+      principal: _principal, 
+      oracle: _oracle, 
+      terms: terms, 
+      totalDebt: targetDebt, 
+      last: block.timestamp, 
+      capacity: _capacity, 
+      capacityInPrincipal: _inPrincipal,
+      enabled: !global.safeMode
+    });
+    
+    id_ = ids.length;
+    bonds[id_] = bond;
+    ids.push(address(_principal));
+  }
+
+  /**
+   * @notice compute target debt and BCV for bond
+   * @return targetDebt_ uint256
+   * @return bcv_ uint256
+   */
+  function _compute(
+    uint256 _capacity, 
+    bool _inPrincipal, 
+    uint256 _length, 
+    IOracle _oracle
+  ) public view returns (uint256 targetDebt_, uint256 bcv_) {
+    uint256 capacity = _capacity;
+    if (_inPrincipal) {
+      capacity = _capacity * _oracle.assetPrice() / 1e8;
+    }
+
+    targetDebt_ = capacity * global.decayRate / _length;
+    uint256 discountedPrice = _oracle.assetPrice() * 98 / 100; // assume average discount of 2%
+    bcv_ = discountedPrice * ohm.totalSupply() / targetDebt_;
+    targetDebt_ = targetDebt_ * 102 / 100; // adjust back up to start at market price
+  }
+  
+  // ensure bond times are appropriate
+  function _checkLengths(uint256 _length, uint256 _vesting, bool _fixedTerm) internal pure {
+    require(_length >= 5e6, "Program must run longer than 6 days");
+    if (!_fixedTerm) {
+      require(_vesting >= _length, "Bond must conclude before expiration");
+    } else {
+      require(_vesting >= 432_000, "Bond must vest longer than 5 days");
+    }
+  }
+
+  /**
+   * @notice enable bond
+   * @dev only necessary if safe mode enabled when bond added
+   * @param _bid uint256
+   */
+  function enableBond(uint256 _bid) external onlyController {
+    bonds[_bid].enabled = true;
+    bonds[_bid].last = block.timestamp;
+  }
+
+  /**
+   * @notice disable existing bond
+   * @param _bid uint
+   */
+  function deprecateBond(uint256 _bid) external onlyController {
+    bonds[_bid].capacity = 0;
+  }
+
+  /**
+   * @notice set global variables
+   * @param _decayRate uint256
+   * @param _maxPayout uint256
+   */
+  function setGlobal(uint256 _decayRate, uint256 _maxPayout) external onlyController {
+    global.decayRate = _decayRate;
+    global.maxPayout = _maxPayout;
+  }
+
+  function toggleSafeMode() external onlyController {
+    global.safeMode = !global.safeMode;
+  }
+
+  /**
+   * @notice set teller contract
+   * @param _teller address
+   */
+  function setTeller(address _teller) external onlyController {
+    require(address(teller) == address(0), "Teller is set");
+    require(_teller != address(0), "Zero address: Teller");
+    teller = ITeller(_teller);
+  }
+
+  /**
+   * @notice sets address that creates/disables bonds
+   * @param _controller address
+   */
+  function setController(address _controller) external onlyController {
+    require(_controller != address(0), "Zero address: Controller");
+    controller = _controller;
   }
 }

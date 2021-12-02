@@ -33,9 +33,8 @@ contract BondTeller is ITeller, OlympusAccessControlled {
     // Info for bond holder
     struct Bond {
         uint256 bondId; // ID of bond in depository
-        uint256 payout; // sOHM remaining to be paid. agnostic balance
+        uint256 payout; // sOHM remaining to be paid. gOHM balance
         uint256 vested; // time when bond is vested
-        uint256 created; // time bond was created
         uint256 redeemed; // time when bond was redeemed (0 if unredeemed)
     }
 
@@ -46,12 +45,14 @@ contract BondTeller is ITeller, OlympusAccessControlled {
     ITreasury internal immutable treasury;
     IERC20 internal immutable ohm;
     IsOHM internal immutable sOHM; // payment token
+    address public immutable dao; 
 
     mapping(address => Bond[]) public bonderInfo; // user data
     mapping(address => uint256[]) public indexesFor; // user bond indexes
 
     mapping(address => uint256) public rewards; // front end operator rewards
-    uint256 public feReward;
+    uint256 public feReward; // reward to front end operator (9 decimals)
+    uint256 public daoReward; // reward to dao (9 decimals)
 
     /* ========== CONSTRUCTOR ========== */
 
@@ -61,6 +62,7 @@ contract BondTeller is ITeller, OlympusAccessControlled {
         address _treasury,
         address _ohm,
         address _sOHM,
+        address _dao,
         address _authority
     ) OlympusAccessControlled(IOlympusAuthority(_authority)) {
         require(_depository != address(0), "Zero address: Depository");
@@ -73,6 +75,8 @@ contract BondTeller is ITeller, OlympusAccessControlled {
         ohm = IERC20(_ohm);
         require(_sOHM != address(0), "Zero address: sOHM");
         sOHM = IsOHM(_sOHM);
+        require(_dao != address(0), "Zero address: DAO");
+        dao = _dao;
     }
 
     /* ========== DEPOSITORY ========== */
@@ -93,12 +97,14 @@ contract BondTeller is ITeller, OlympusAccessControlled {
         uint256 _expires,
         address _feo
     ) external override onlyDepository returns (uint256 index_) {
-        uint256 reward = _payout * feReward / 1e5;
+        uint256 toFEO = _payout * feReward / 1e9;
+        uint256 toDAO = _payout * daoReward / 1e9;
 
-        treasury.mint(address(this), _payout.add(reward));
+        treasury.mint(address(this), _payout.add(toFEO.add(toDAO)));
         staking.stake(address(this), _payout, true, true);
 
-        rewards[_feo] += reward; // front end operator reward
+        rewards[_feo] += toFEO; // front end operator reward
+        rewards[dao] += toDAO; // dao reward
 
         index_ = bonderInfo[_bonder].length;
 
@@ -108,7 +114,6 @@ contract BondTeller is ITeller, OlympusAccessControlled {
                 bondId: _bid,
                 payout: sOHM.toG(_payout),
                 vested: _expires,
-                created: block.timestamp,
                 redeemed: 0
             })
         );
@@ -171,9 +176,13 @@ contract BondTeller is ITeller, OlympusAccessControlled {
 
     /* ========== OWNABLE FUNCTIONS ========== */
 
-    // set reward for front end operator (4 decimals. 100 = 1%)
-    function setFEReward(uint256 reward) external override onlyPolicy {
-        feReward = reward;
+    // set reward for front end operator (9 decimals)
+    function setReward(bool fe, uint256 reward) external override onlyPolicy {
+        if (fe) {
+            feReward = reward;
+        } else {
+            daoReward = reward;
+        }
     }
 
     /* ========== VIEW FUNCTIONS ========== */
@@ -224,22 +233,5 @@ contract BondTeller is ITeller, OlympusAccessControlled {
             }
         }
         pending_ = sOHM.fromG(pending_);
-    }
-
-    // VESTING
-
-    /**
-     * @notice calculate how far into vesting a depositor is
-     * @param _bonder address
-     * @param _index uint256
-     * @return uint256
-     */
-    function percentVestedFor(address _bonder, uint256 _index) public view override returns (uint256) {
-        Bond memory bond = bonderInfo[_bonder][_index];
-
-        uint256 timeSince = block.timestamp - bond.created;
-        uint256 term = bond.vested - bond.created;
-
-        return timeSince * 1e9 / term;
     }
 }
