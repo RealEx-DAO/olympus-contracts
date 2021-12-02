@@ -59,7 +59,7 @@ contract gOHM is IgOHM {
         require(_migrator != address(0), "Zero address: Migrator");
         approved = _migrator;
         require(_v1Staking != address(0), "Zero address: Staking");
-        staking = IsOHM(_v1Staking); // for continuous index data
+        sOHM = IsOHM(_v1Staking); // for continuous index data
     }
 
     /* ========== MUTATIVE FUNCTIONS ========== */
@@ -156,7 +156,7 @@ contract gOHM is IgOHM {
 
     /* ========== VIEW FUNCTIONS ========== */
 
-    function index() public view override returns (uint256) {
+    function index() public view returns (uint256) {
         return sOHM.index();
     }
     /**

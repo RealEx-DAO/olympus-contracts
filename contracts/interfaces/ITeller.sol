@@ -17,5 +17,4 @@ interface ITeller {
     function vested(address _bonder, uint256 _index) external view returns (bool);
     function pendingForIndexes(address _bonder, uint256[] memory _indexes) external view returns (uint256 pending_);
     function totalPendingFor(address _bonder) external view returns (uint256 pending_);
-    function percentVestedFor(address _bonder, uint256 _index) external view returns (uint256 percentVested_);
 }
