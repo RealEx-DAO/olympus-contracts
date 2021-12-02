@@ -109,7 +109,7 @@ contract OlympusBondDepository {
     if (info.capacityInPrincipal) { // capacity is in principal terms
       cap = _amount; 
     } 
-    require(info.capacity >= cap, "Capacity overflow"); // ensure there is remaining capacity
+    require(info.capacity >= cap, "Capacity exceeded"); // ensure there is remaining capacity
     info.capacity -= cap;
 
     _payoutWithinBounds(payout_);

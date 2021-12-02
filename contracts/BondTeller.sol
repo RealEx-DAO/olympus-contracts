@@ -51,8 +51,7 @@ contract BondTeller is ITeller, OlympusAccessControlled {
     mapping(address => uint256[]) public indexesFor; // user bond indexes
 
     mapping(address => uint256) public rewards; // front end operator rewards
-    uint256 public feReward; // reward to front end operator (9 decimals)
-    uint256 public daoReward; // reward to dao (9 decimals)
+    uint256[] public reward; // reward to [front end operator, dao] (9 decimals)
 
     /* ========== CONSTRUCTOR ========== */
 
@@ -97,8 +96,8 @@ contract BondTeller is ITeller, OlympusAccessControlled {
         uint256 _expires,
         address _feo
     ) external override onlyDepository returns (uint256 index_) {
-        uint256 toFEO = _payout * feReward / 1e9;
-        uint256 toDAO = _payout * daoReward / 1e9;
+        uint256 toFEO = _payout * reward[0] / 1e9;
+        uint256 toDAO = _payout * reward[1] / 1e9;
 
         treasury.mint(address(this), _payout.add(toFEO.add(toDAO)));
         staking.stake(address(this), _payout, true, true);
@@ -148,6 +147,7 @@ contract BondTeller is ITeller, OlympusAccessControlled {
             }
         }
         dues = sOHM.fromG(dues);
+        require(dues > 0, "Zero redemption error");
         sOHM.safeTransfer(_bonder, dues);
         return dues;
     }
@@ -177,11 +177,11 @@ contract BondTeller is ITeller, OlympusAccessControlled {
     /* ========== OWNABLE FUNCTIONS ========== */
 
     // set reward for front end operator (9 decimals)
-    function setReward(bool fe, uint256 reward) external override onlyPolicy {
-        if (fe) {
-            feReward = reward;
+    function setReward(bool _fe, uint256 _reward) external override onlyPolicy {
+        if (_fe) {
+            reward[0] = _reward;
         } else {
-            daoReward = reward;
+            reward[1] = _reward;
         }
     }
 
